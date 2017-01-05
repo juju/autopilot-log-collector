@@ -1,0 +1,613 @@
+#!/usr/bin/python
+
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+import errno
+from functools import partial
+import logging
+import multiprocessing
+import os
+import shutil
+from subprocess import (
+    CalledProcessError, check_call, check_output, call, STDOUT)
+import sys
+from tempfile import mkdtemp
+
+import yaml
+
+
+log = logging.getLogger("collect-logs")
+PRG = os.path.abspath(__file__)
+LOGS = [
+    # Basics
+    "/var/log",
+    "/etc/hosts",
+    "/etc/network",
+    # for the landscape client
+    "/var/lib/landscape/client",
+    # for the landscape server charm
+    "/etc/apache2",
+    "/etc/haproxy",
+    # XXX This should be handled by the per-unit logs.
+    "/var/lib/lxc/*/rootfs/var/log",
+    # logs and configs for juju 1 using LXC (not LXD)
+    "/var/lib/juju/containers",
+    # for openstack
+    "/etc/nova",
+    "/etc/swift",
+    "/etc/neutron",
+    "/etc/ceph",
+    "/etc/glance",
+    ]
+EXCLUDED = ["/var/lib/landscape/client/package/hash-id",
+            "/var/lib/juju/containers/juju-*-lxc-template"]
+LANDSCAPE_JUJU_HOME = "/var/lib/landscape/juju-homes"
+
+JUJU1 = "juju"
+# XXX This is going to break once juju-2.1 happens.
+# See https://bugs.launchpad.net/juju-core/+bug/1613864.
+JUJU2 = "juju-2.1"
+JUJU = JUJU1
+
+DEFAULT_MODEL = object()
+
+VERBOSE = False
+
+
+if VERBOSE:
+    def call(args, env=None, _call=call):
+        print("  running {!r}".format(" ".join(args)))
+        return _call(args, env=env)
+
+    def check_call(args, env=None, _check_call=check_call):
+        print("  running {!r}".format(" ".join(args)))
+        return _check_call(args, env=env)
+
+    def check_output(args, stderr=None, env=None, _check_output=check_output):
+        print("  running {!r}".format(" ".join(args)))
+        return _check_output(args, stderr=stderr, env=env)
+
+
+class Juju(object):
+    """A wrapper around a juju binary."""
+
+    def __init__(self, binary_path=None, model=None, cfgdir=None, sudo=None):
+        if binary_path is None:
+            binary_path = JUJU
+        if model is DEFAULT_MODEL:
+            model = None
+
+        self.binary_path = binary_path
+        self.model = model
+        self.cfgdir = cfgdir
+        self.sudo = sudo
+
+        if binary_path == JUJU1:
+            self.envvar = "JUJU_HOME"
+        else:
+            self.envvar = "JUJU_DATA"
+
+        self.env = None
+        if cfgdir is not None:
+            self.env = dict(os.environ, **{self.envvar: cfgdir})
+
+    def __repr__(self):
+        args = ", ".join("{}={!r}".format(name, getattr(self, name))
+                         for name in ("binary_path", "model", "cfgdir"))
+        return "{}({})".format(self.__class__.__name__, args)
+
+    def __eq__(self, other):
+        if self.binary_path != other.binary_path:
+            return False
+        if self.model != other.model:
+            return False
+        if self.cfgdir != other.cfgdir:
+            return False
+        if self.sudo != other.sudo:
+            return False
+        return True
+
+    def __ne__(self, other):
+        return not(self == other)
+
+    @property
+    def envstr(self):
+        if not self.cfgdir:
+            return ""
+        else:
+            return "{}={}".format(self.envvar, self.cfgdir)
+
+    def status_args(self):
+        """Return the subprocess.* args for a status command."""
+        args = self._resolve("status", "--format=yaml")
+        return args
+
+    def format_status(self):
+        """Return the formatted juju status command."""
+        args = self.status_args()
+        return self._format(args)
+
+    def set_model_config_args(self, key, value):
+        item = "{}={}".format(key, value)
+        if self.binary_path == JUJU1:
+            args = self._resolve("set-env", item)
+        else:
+            args = self._resolve("model-config", item)
+        return args
+
+    def format_set_model_config(self, key, value):
+        """Return the formatted model config command."""
+        args = self.set_model_config_args(key, value)
+        return self._format(args)
+
+    def ssh_args(self, unit, cmd):
+        """Return the subprocess.* args for an SSH command."""
+        return self._resolve("ssh", unit, cmd)
+
+    def pull_args(self, unit, source, target="."):
+        """Return the subprocess.* args for an SCP command."""
+        source = "{}:{}".format(unit, source)
+        return self._resolve("scp", source, target)
+
+    def push_args(self, unit, source, target):
+        """Return the subprocess.* args for an SCP command."""
+        target = "{}:{}".format(unit, target)
+        return self._resolve("scp", source, target)
+
+    def format(self, cmd, *subargs):
+        """Return the formatted command.
+
+        "sudo" and the juju config dir env var are set if appropriate.
+        """
+        args = [cmd]
+        args.extend(subargs)
+        return self._format(args)
+
+    def _format(self, args):
+        """Return the formatted args.
+
+        "sudo" and the juju config dir env var are set if appropriate.
+        """
+        if self.cfgdir:
+            args.insert(0, self.envstr)
+        if self.sudo == "" or self.sudo is True:
+            args.insert(0, "sudo")
+        elif self.sudo:
+            args.insert(0, "sudo -u {}".format(self.sudo))
+        return " ".join(args)
+
+    def _resolve(self, sub, *subargs):
+        """Return the subprocess.* args for the juju subcommand."""
+        args = [self.binary_path, sub]
+        if self.model:
+            if self.binary_path == JUJU1:
+                args.append("-e")
+            else:
+                args.append("-m")
+            args.append(self.model)
+        args.extend(subargs)
+        return args
+
+
+def format_collect_logs(juju, script, target, inner=True):
+    """Return the formatted command for the collect_logs script."""
+    if inner:
+        args = [script, "--inner"]
+    else:
+        args = [script]
+    args.extend(["--juju", juju.binary_path])
+    if juju.model and juju.model is not DEFAULT_MODEL:
+        args.extend(["--model", juju.model])
+    if juju.cfgdir:
+        args.extend(["--cfgdir", juju.cfgdir])
+    args.append(target)
+    return juju._format(args)
+
+
+def juju_status(juju):
+    """Return a juju status structure."""
+    output = check_output(juju.status_args(), env=juju.env)
+    output = output.decode("utf-8").strip()
+    return yaml.load(output)
+
+
+def get_units(juju, status=None):
+    """Return a list with all units."""
+    if status is None:
+        status = juju_status(juju)
+    units = []
+    if "services" in status:
+        applications = status["services"]
+    else:
+        applications = status["applications"]
+    for application in applications:
+        # skip subordinate charms
+        if "subordinate-to" in applications[application].keys():
+            continue
+        if "units" in applications[application]:
+            units.extend(applications[application]["units"].keys())
+    if len(units) == 0:
+        sys.exit("ERROR, no units found. Make sure the right juju environment"
+                 "is set.")
+    return units
+
+
+def _create_ps_output_file(juju, unit):
+    """List running processes and redirect them to a file."""
+    log.info("Collecting ps output on unit {}".format(unit))
+    ps_cmd = "ps fauxww | sudo tee /var/log/ps-fauxww.txt"
+    args = juju.ssh_args(unit, ps_cmd)
+    try:
+        check_output(args, stderr=STDOUT, env=juju.env)
+    except CalledProcessError as e:
+        log.warning(
+            "Failed to collect running processes on unit {}".format(unit))
+        log.warning(e.output)
+        log.warning(e.returncode)
+
+
+def _create_log_tarball(juju, unit):
+    log.info("Creating tarball on unit {}".format(unit))
+    exclude = " ".join(["--exclude=%s" % x for x in EXCLUDED])
+    logs = "$(sudo sh -c \"ls -1d %s 2>/dev/null\")" % " ".join(LOGS)
+    # --ignore-failed-read avoids failure for unreadable files (not for files
+    # being written)
+    tar_cmd = "sudo tar --ignore-failed-read"
+    logsuffix = unit.replace("/", "-")
+    if unit == "0":
+        logsuffix = "bootstrap"
+    cmd = "{} {} -cf /tmp/logs_{}.tar {}".format(
+        tar_cmd, exclude, logsuffix, logs)
+    args = juju.ssh_args(unit, cmd)
+    ATTEMPTS = 5
+    for i in range(ATTEMPTS):
+        log.info("...attempt {} of {}".format(i+1, ATTEMPTS))
+        try:
+            check_output(args, stderr=STDOUT, env=juju.env)
+        except CalledProcessError as e:
+            # Note: tar command returns 1 for everything it considers a
+            # warning, 2 for fatal errors. Since we are backing up
+            # log files that are actively being written, or part of a live
+            # system, logging and ignoring such warnings (return code 1) is
+            # what we can do now.
+            # Everything else we might retry as usual.
+            if e.returncode == 1:
+                log.warning(
+                    "tar returned 1, proceeding anyway: {}".format(e.output))
+                break
+            log.warning(
+                "Failed to archive log files on unit {}".format(unit))
+            log.warning(e.output)
+            log.warning(e.returncode)
+            if i < 4:
+                log.warning("...retrying...")
+            cmd = "{} {} --update -f /tmp/logs_{}.tar {}".format(
+                tar_cmd, exclude, logsuffix, logs)
+            args = juju.ssh_args(unit, cmd)
+        else:
+            # The command succeeded so we stop the retry loop.
+            break
+    else:
+        # Don't bother compressing.
+        log.warning("...{} attempts failed; giving up".format(ATTEMPTS))
+        return
+    cmd = "sudo gzip -f /tmp/logs_{}.tar".format(logsuffix)
+    args = juju.ssh_args(unit, cmd)
+    try:
+        check_output(args, stderr=STDOUT, env=juju.env)
+    except CalledProcessError as e:
+        log.warning(
+            "Failed to create remote log tarball on unit {}".format(unit))
+        log.warning(e.output)
+        log.warning(e.returncode)
+
+
+def download_log_from_unit(juju, unit):
+    log.info("Downloading tarball from unit %s" % unit)
+    unit_filename = unit.replace("/", "-")
+    if unit == "0":
+        unit_filename = "bootstrap"
+    remote_filename = "logs_%s.tar.gz" % unit_filename
+    try:
+        args = juju.pull_args(unit, "/tmp/" + remote_filename)
+        call(args, env=juju.env)
+        os.mkdir(unit_filename)
+        args = ["tar", "-C", unit_filename, "-xzf", remote_filename]
+        call(args)
+        os.unlink(remote_filename)
+    except:
+        log.warning("error collecting logs from %s, skipping" % unit)
+    finally:
+        if os.path.exists(remote_filename):
+            os.unlink(remote_filename)
+
+
+def collect_logs(juju):
+    """
+    Remotely, on each unit, create a tarball with the requested log files
+    or directories, if they exist. If a requested log does not exist on a
+    particular unit, it's ignored.
+    After each tarball is created, it's downloaded to the current directory
+    and expanded, and the tarball is then deleted.
+    """
+    units = get_units(juju)
+    # include bootstrap
+    units.append("0")
+
+    log.info("Collecting running processes for all units including bootstrap")
+    map(partial(_create_ps_output_file, juju), units)
+
+    log.info("Creating remote tarball in parallel for units %s" % (
+        ",".join(units)))
+    map(partial(_create_log_tarball, juju), units)
+    log.info("Downloading logs from units")
+
+    _mp_map(partial(download_log_from_unit, juju), units)
+
+
+def _mp_map(func, args):
+    pool = multiprocessing.Pool(processes=4)
+    pool.map(func, args)
+
+
+def get_landscape_unit(units):
+    """Return the landscape unit among the units list."""
+    units = [
+        unit for unit in units if unit.startswith("landscape-server/") or
+        unit.startswith("landscape/")]
+    if len(units) == 0:
+        return None
+    else:
+        # XXX we don't yet support multiple landscape units. We would have to
+        # find out which one has the juju home
+        return units[0]
+
+
+def get_inner_model(version, inner_model=DEFAULT_MODEL):
+    """Return a best-effort guess at the inner model name."""
+    if inner_model is not DEFAULT_MODEL:
+        return inner_model
+    if version == JUJU1:
+        return None
+    # We assume that this is a Landscape-bootstrapped controller.
+    return "controller"
+
+
+def disable_inner_ssh_proxy(juju, landscape_unit, inner_model=DEFAULT_MODEL):
+    """
+    Workaround for #1607076: disable the proxy-ssh juju environment setting
+    for the inner cloud so we can juju ssh into it.
+    """
+    log.info("Disabling proxy-ssh in the juju environment on "
+             "{}".format(landscape_unit))
+
+    cfgdir = "{0}/`sudo ls -rt {0}/ | tail -1`".format(LANDSCAPE_JUJU_HOME)
+    key = "proxy-ssh"
+    value = "false"
+
+    # Try Juju 2.
+    model2 = get_inner_model(JUJU2, inner_model)
+    inner2 = Juju(JUJU2, model=model2, cfgdir=cfgdir, sudo=True)
+    cmd2 = inner2.format_set_model_config(key, value)
+    args2 = juju.ssh_args(landscape_unit, cmd2)
+    try:
+        check_output(args2, stderr=STDOUT, env=juju.env)
+    except CalledProcessError as e:
+        log.warning("Couldn't disable proxy-ssh in the inner environment "
+                    "using Juju 2, attempting Juju 1.")
+        log.warning("Error was:\n{}".format(e.output))
+    else:
+        return
+
+    # Try Juju 1.
+    model1 = get_inner_model(JUJU1, inner_model)
+    inner1 = Juju(JUJU1, model=model1, cfgdir=cfgdir, sudo=True)
+    cmd1 = inner1.format_set_model_config(key, value)
+    args1 = juju.ssh_args(landscape_unit, cmd1)
+    try:
+        check_output(args1, stderr=STDOUT, env=juju.env)
+    except CalledProcessError as e:
+        log.warning("Couldn't disable proxy-ssh in the inner environment "
+                    "using Juju 1, collecting inner logs might fail.")
+        log.warning("Error was:\n{}".format(e.output))
+
+
+
+def find_inner_juju(juju, landscape_unit, inner_model=DEFAULT_MODEL):
+    """Return the juju dir and binary path, if any."""
+    # Identify the most recent juju "home" that landscape is using.
+    cmd = "sudo ls -rt {}/".format(LANDSCAPE_JUJU_HOME)
+    args = juju.ssh_args(landscape_unit, cmd)
+    try:
+        output = check_output(args, env=juju.env).strip()
+    except CalledProcessError:
+        return None
+    if output.startswith("sudo: "):
+        _, _, output = output.partition("\r\n")
+    indices = [m for m in output.split() if m and m.isdigit()]
+    if not indices:
+        return None
+    index = indices[-1]
+    juju_dir = os.path.join(LANDSCAPE_JUJU_HOME, index)
+
+    # Try Juju 2.
+    model2 = get_inner_model(JUJU2, inner_model)
+    inner2 = Juju(JUJU2, model=model2, cfgdir=juju_dir, sudo="")
+    cmd2 = inner2.format_status()
+    args2 = juju.ssh_args(landscape_unit, cmd2)
+    if call(args2, env=juju.env) == 0:
+        log.info("using Juju 2 for inner model")
+        return inner2
+
+    # Try Juju 1.
+    model1 = get_inner_model(JUJU1, inner_model)
+    inner1 = Juju(JUJU1, model=model1, cfgdir=juju_dir, sudo="landscape")
+    cmd1 = inner1.format_status()
+    args1 = juju.ssh_args(landscape_unit, cmd1)
+    if call(args1, env=juju.env) == 0:
+        log.info("using Juju 1 for inner model")
+        return inner1
+
+    # We didn't find an inner model.
+    return None
+
+
+def collect_inner_logs(juju, inner_model=DEFAULT_MODEL):
+    """Collect logs from an inner landscape[-server]/0 unit."""
+    log.info("Collecting logs on inner environment")
+    units = get_units(juju)
+    landscape_unit = get_landscape_unit(units)
+    if not landscape_unit:
+        log.info("No landscape[-server]/N found, skipping")
+        return
+    log.info("Found landscape unit {}".format(landscape_unit))
+
+    disable_inner_ssh_proxy(juju, landscape_unit, inner_model)
+
+    # Look up the inner model.
+    inner_juju = find_inner_juju(juju, landscape_unit, inner_model)
+    if inner_juju is None:
+        log.info(("No active inner environment found on {}, skipping"
+                  ).format(landscape_unit))
+        return
+
+    # Prepare to get the logs from the inner model.
+    collect_logs = "/tmp/collect-logs"
+    args = juju.push_args(landscape_unit, PRG, collect_logs)
+    call(args, env=juju.env)
+    filename = "inner-logs.tar.gz"
+    inner_filename = os.path.join("/tmp", filename)
+    args = juju.ssh_args(landscape_unit, "sudo rm -rf " + inner_filename)
+    call(args, env=juju.env)
+
+    # Collect the logs for the inner model.
+    cmd = format_collect_logs(inner_juju, collect_logs, inner_filename)
+    args = juju.ssh_args(landscape_unit, cmd)
+    check_call(args, env=juju.env)
+
+    # Copy the inner logs into a local directory.
+    log.info("Copying inner environment back")
+    cwd = os.getcwd()
+    target = os.path.join(cwd, filename)
+    args = juju.pull_args(landscape_unit, inner_filename, target)
+    check_call(args, env=juju.env)
+    try:
+        inner_dir = "landscape-0-inner-logs"
+        os.mkdir(inner_dir)
+        os.chdir(inner_dir)
+        try:
+            check_call(["tar", "-zxf", os.path.join(cwd, filename)])
+        finally:
+            os.chdir(cwd)
+    finally:
+        try:
+            os.remove(target)
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                log.warning(
+                    "failed to remove inner logs tarball: {}".format(e))
+
+
+def bundle_logs(tmpdir, tarfile, extrafiles=[]):
+    """
+    Create a tarball with the directories under tmpdir and the
+    specified extra files. The tar command is executed outside
+    of tmpdir, so we need to a) use an absolute path that
+    includes tmpdir; and b) strip the tmpdir so it's not part of
+    the tarball.
+    We don't want absolute paths for extra files because otherwise
+    this path would be inside the tarball.
+
+    This allows you to have a tarball where this:
+      /tmp/tmpdir/foo
+      /tmp/tmpdir/bar
+      /home/ubuntu/data/log
+
+    Becomes this inside the tarball:
+      foo
+      bar
+      data/log
+
+    If collect-logs is run with CWD=/home/ubuntu and given data/log as
+    the extra file.
+    """
+    args = ["tar", "czf", tarfile]
+    # get rid of the tmpdir prefix
+    args.extend(["--transform", "s,{}/,,".format(tmpdir[1:])])
+    # need absolute paths since tmpdir isn't the cwd
+    args.extend(os.path.join(tmpdir, d) for d in sorted(os.listdir(tmpdir)))
+    if extrafiles:
+        args.extend(extrafiles)
+    call(args)
+
+
+def get_juju(binary_path, model=DEFAULT_MODEL, cfgdir=None, inner=False):
+    """Return a Juju for the provided info."""
+    if model is DEFAULT_MODEL and inner and binary_path != JUJU1:
+        # We assume that this is a Landscape-bootstrapped controller.
+        model = "controller"
+    return Juju(binary_path, model=model, cfgdir=cfgdir)
+
+
+def get_option_parser():
+    description = ("Collect logs from current juju environment and, if an "
+                   "inner autopilot cloud is detected, include that.")
+    parser = ArgumentParser(description=description,
+                            formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--inner", action="store_true", default=False,
+                        help="Collect logs for an inner model.")
+    parser.add_argument("--juju", default=JUJU2,
+                        help="The Juju binary to use.")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help="The Juju model to use.")
+    parser.add_argument("--inner-model", default=DEFAULT_MODEL,
+                        help="The Juju model to use for the inner juju.")
+    parser.add_argument("--cfgdir",
+                        help="The Juju config dir to use.")
+    parser.add_argument("tarfile", help="Full path to tarfile to create.")
+    parser.add_argument("extrafiles", help="Optional full path to extra "
+                        "logfiles to include, space separated", nargs="*")
+    return parser
+
+
+def main(tarfile, extrafiles, juju=None, inner_model=DEFAULT_MODEL,
+         inner=False):
+    if juju is None:
+        juju = Juju()
+
+    # we need the absolute path because we will be changing
+    # the cwd
+    tmpdir = mkdtemp()
+    cwd = os.getcwd()
+    # logs are collected inside a temporary directory
+    os.chdir(tmpdir)
+    try:
+        collect_logs(juju)
+        if not inner:
+            try:
+                collect_inner_logs(juju, inner_model)
+            except:
+                log.warning("Collecting inner logs failed, continuing")
+        # we create the final tarball outside of tmpdir to we can
+        # add the extrafiles to the tarball root
+        os.chdir(cwd)
+        bundle_logs(tmpdir, tarfile, extrafiles)
+        log.info("created: %s" % tarfile)
+    finally:
+        call(["chmod", "-R", "u+w", tmpdir])
+        shutil.rmtree(tmpdir)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+    parser = get_option_parser()
+    args = parser.parse_args(sys.argv[1:])
+    tarfile = os.path.abspath(args.tarfile)
+    juju = get_juju(args.juju, args.model, args.cfgdir, args.inner)
+    if args.inner:
+        log.info("# start inner ##############################")
+    try:
+        main(tarfile, args.extrafiles, juju, args.inner_model, args.inner)
+    finally:
+        if args.inner:
+            log.info("# end inner ################################")
