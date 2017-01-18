@@ -3,6 +3,7 @@
 # To run: "python -m unittest test_collect-logs"
 
 import errno
+from fixtures import EnvironmentVariableFixture, TestWithFixtures
 import os
 import os.path
 import shutil
@@ -85,7 +86,7 @@ class _BaseTestCase(TestCase):
         self.assertEqual(cwd, dirname)
 
 
-class GetJujuTests(TestCase):
+class GetJujuTests(TestWithFixtures):
 
     def test_juju1_outer(self):
         """
@@ -116,6 +117,52 @@ class GetJujuTests(TestCase):
 
         expected = script.Juju("juju-2.1", model=None)
         self.assertEqual(juju, expected)
+
+    def test_get_args_without_ssh_uses_ip_address(self):
+        """
+        When juju_ssh is False, get_juju returns direct ssh commands from
+        Juju.ssh_args using using the unit's IP address instead of hostname.
+        """
+        self.useFixture(
+            EnvironmentVariableFixture("JUJU_DATA", "some-dir"))
+        juju = script.get_juju(script.JUJU2, inner=False, juju_ssh=False)
+        expected = [
+            "/usr/bin/ssh", "-o", "StrictHostKeyChecking=no",
+            "-i", "some-dir/ssh/juju_id_rsa",
+            "ubuntu@10.1.1.1", "ls tmp"]
+        self.assertFalse(juju.juju_ssh)
+        unit = script.JujuUnit("ubuntu/0", "10.1.1.1")
+        self.assertEqual(expected, juju.ssh_args(unit,"ls tmp"))
+
+    def test_pull_args_without_ssh_uses_ip_address(self):
+        """
+        When juju_ssh is False, get_juju returns direct ssh commands from
+        Juju.pull_args using using the unit's IP address instead of hostname.
+        """
+        self.useFixture(
+            EnvironmentVariableFixture("JUJU_DATA", "some-dir"))
+        juju = script.get_juju(script.JUJU2, inner=False, juju_ssh=False)
+        expected = [
+            "/usr/bin/scp", "-o", "StrictHostKeyChecking=no",
+            "-i", "some-dir/ssh/juju_id_rsa",
+            "ubuntu@10.1.1.1:file1", "."]
+        unit = script.JujuUnit("ubuntu/0", "10.1.1.1")
+        self.assertEqual(expected, juju.pull_args(unit, "file1"))
+
+    def test_push_args_without_ssh_uses_ip_address(self):
+        """
+        When juju_ssh is False, get_juju returns direct ssh commands from
+        Juju.push_args using using the unit's IP address instead of hostname.
+        """
+        self.useFixture(
+            EnvironmentVariableFixture("JUJU_DATA", "some-dir"))
+        juju = script.get_juju(script.JUJU2, inner=False, juju_ssh=False)
+        expected = [
+            "/usr/bin/scp", "-o", "StrictHostKeyChecking=no",
+            "-i", "some-dir/ssh/juju_id_rsa",
+            "file1", "ubuntu@10.1.1.1:/tmp/blah"]
+        unit = script.JujuUnit("ubuntu/0", "10.1.1.1")
+        self.assertEqual(expected, juju.push_args(unit, "file1", "/tmp/blah"))
 
     def test_juju2_inner(self):
         """
@@ -262,18 +309,19 @@ class MainTestCase(_BaseTestCase):
 
 class CollectLogsTestCase(_BaseTestCase):
 
-    MOCKED = ("get_units", "check_output", "call")
+    MOCKED = ("get_units", "get_bootstrap_ip", "check_output", "call")
 
     def setUp(self):
         super(CollectLogsTestCase, self).setUp()
 
         self.units = [
-            "landscape-server/0",
-            "postgresql/0",
-            "rabbitmq-server/0",
-            "haproxy/0",
+            script.JujuUnit("landscape-server/0", "1.2.3.4"),
+            script.JujuUnit("postgresql/0", "1.2.3.5"),
+            script.JujuUnit("rabbitmq-server/0", "1.2.3.6"),
+            script.JujuUnit("haproxy/0", "1.2.3.7"),
             ]
         script.get_units.return_value = self.units[:]
+        script.get_bootstrap_ip.return_value = self.units[0].ip
 
         self.mp_map_orig = script._mp_map
         script._mp_map = lambda f, a: map(f, a)
@@ -304,18 +352,18 @@ class CollectLogsTestCase(_BaseTestCase):
 
         script.get_units.assert_called_once_with(self.juju)
         expected = []
-        units = self.units + ["0"]
+        units = self.units + [script.JujuUnit("0", "1.2.3.3")]
         # for _create_ps_output_file()
         for unit in units:
             cmd = "ps fauxww | sudo tee /var/log/ps-fauxww.txt"
-            expected.append(mock.call(["juju", "ssh", unit, cmd],
+            expected.append(mock.call(["juju", "ssh", unit.name, cmd],
                                       stderr=subprocess.STDOUT,
                                       env=None,
                                       ))
         # for _create_log_tarball()
         for unit in units:
-            tarfile = "/tmp/logs_{}.tar".format(unit.replace("/", "-")
-                                                if unit != "0"
+            tarfile = "/tmp/logs_{}.tar".format(unit.name.replace("/", "-")
+                                                if unit.name != "0"
                                                 else "bootstrap")
             cmd = ("sudo tar --ignore-failed-read"
                    " --exclude=/var/lib/landscape/client/package/hash-id"
@@ -339,11 +387,11 @@ class CollectLogsTestCase(_BaseTestCase):
                                  "/etc/glance",
                                  ]),
                        )
-            expected.append(mock.call(["juju", "ssh", unit, cmd],
+            expected.append(mock.call(["juju", "ssh", unit.name, cmd],
                                       stderr=subprocess.STDOUT,
                                       env=None,
                                       ))
-            expected.append(mock.call(["juju", "ssh", unit,
+            expected.append(mock.call(["juju", "ssh", unit.name,
                                        "sudo gzip -f {}".format(tarfile)],
                                       stderr=subprocess.STDOUT,
                                       env=None,
@@ -353,9 +401,12 @@ class CollectLogsTestCase(_BaseTestCase):
         # for download_log_from_unit()
         expected = []
         for unit in units:
-            name = unit.replace("/", "-") if unit != "0" else "bootstrap"
+            if unit.name != "0":
+                name = unit.name.replace("/", "-")
+            else:
+                name = "bootstrap"
             filename = "logs_{}.tar.gz".format(name)
-            source = "{}:/tmp/{}".format(unit, filename)
+            source = "{}:/tmp/{}".format(unit.name, filename)
             expected.append(mock.call(["juju", "scp", source, "."], env=None))
             expected.append(mock.call(["tar", "-C", name, "-xzf", filename]))
             self.assertFalse(os.path.exists(filename))
@@ -376,19 +427,19 @@ class CollectLogsTestCase(_BaseTestCase):
 
         script.get_units.assert_called_once_with(juju)
         expected = []
-        units = self.units + ["0"]
+        units = self.units + [script.JujuUnit("0", "1.2.3.3")]
         # for _create_ps_output_file()
         for unit in units:
             cmd = "ps fauxww | sudo tee /var/log/ps-fauxww.txt"
             expected.append(mock.call(["juju-2.1", "ssh",
-                                       "-m", "controller", unit, cmd],
+                                       "-m", "controller", unit.name, cmd],
                                       stderr=subprocess.STDOUT,
                                       env=juju.env,
                                       ))
         # for _create_log_tarball()
         for unit in units:
-            tarfile = "/tmp/logs_{}.tar".format(unit.replace("/", "-")
-                                                if unit != "0"
+            tarfile = "/tmp/logs_{}.tar".format(unit.name.replace("/", "-")
+                                                if unit.name != "0"
                                                 else "bootstrap")
             cmd = ("sudo tar --ignore-failed-read"
                    " --exclude=/var/lib/landscape/client/package/hash-id"
@@ -413,12 +464,12 @@ class CollectLogsTestCase(_BaseTestCase):
                                  ]),
                        )
             expected.append(mock.call(
-                ["juju-2.1", "ssh", "-m", "controller", unit, cmd],
+                ["juju-2.1", "ssh", "-m", "controller", unit.name, cmd],
                 stderr=subprocess.STDOUT,
                 env=juju.env,
                 ))
             expected.append(mock.call(
-                ["juju-2.1", "ssh", "-m", "controller", unit,
+                ["juju-2.1", "ssh", "-m", "controller", unit.name,
                  "sudo gzip -f {}".format(tarfile)],
                  stderr=subprocess.STDOUT,
                  env=juju.env,
@@ -428,9 +479,12 @@ class CollectLogsTestCase(_BaseTestCase):
         # for download_log_from_unit()
         expected = []
         for unit in units:
-            name = unit.replace("/", "-") if unit != "0" else "bootstrap"
+            if unit.name != "0":
+                name = unit.name.replace("/", "-")
+            else:
+                name = "bootstrap"
             filename = "logs_{}.tar.gz".format(name)
-            source = "{}:/tmp/{}".format(unit, filename)
+            source = "{}:/tmp/{}".format(unit.name, filename)
             expected.append(mock.call(
                 ["juju-2.1", "scp", "-m", "controller", source, "."],
                 env=juju.env))
@@ -485,11 +539,14 @@ class CollectLogsTestCase(_BaseTestCase):
         script.collect_logs(self.juju)
 
         script.get_units.assert_called_once_with(self.juju)
-        units = self.units + ["0"]
+        units = self.units + [script.JujuUnit("0", "1.2.3.3")]
         self.assertEqual(script.check_output.call_count, len(units) * 3)
         self.assertEqual(script.call.call_count, len(units) * 2 - 1)
         for unit in units:
-            name = unit.replace("/", "-") if unit != "0" else "bootstrap"
+            if unit.name != "0":
+                name = unit.name.replace("/", "-")
+            else:
+                name = "bootstrap"
             if unit == self.units[1]:
                 self.assertFalse(os.path.exists(name))
             else:
@@ -506,10 +563,10 @@ class CollectInnerLogsTestCase(_BaseTestCase):
         super(CollectInnerLogsTestCase, self).setUp()
 
         self.units = [
-            "landscape-server/0",
-            "postgresql/0",
-            "rabbitmq-server/0",
-            "haproxy/0",
+            script.JujuUnit("landscape-server/0" , "1.2.3.4"),
+            script.JujuUnit("postgresql/0", "1.2.3.5"),
+            script.JujuUnit("rabbitmq-server/0", "1.2.3.6"),
+            script.JujuUnit("haproxy/0", "1.2.3.7"),
             ]
         script.get_units.return_value = self.units[:]
         script.check_output.return_value = "0\n"
@@ -685,7 +742,7 @@ class CollectInnerLogsTestCase(_BaseTestCase):
         """
         collect_inner_logs() correctly supports legacy landscape installations.
         """
-        self.units[0] = "landscape/0"
+        self.units[0] = script.JujuUnit("landscape/0", "1.2.3.4")
         script.get_units.return_value = self.units[:]
         err = subprocess.CalledProcessError(1, "...", "<output>")
         script.check_output.side_effect = [err,

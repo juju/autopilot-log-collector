@@ -1,6 +1,7 @@
 #!/usr/bin/python
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
+from collections import namedtuple
 import errno
 from functools import partial
 import logging
@@ -52,6 +53,7 @@ DEFAULT_MODEL = object()
 
 VERBOSE = False
 
+JujuUnit = namedtuple("JujuUnit", ["name", "ip"])
 
 if VERBOSE:
     def call(args, env=None, _call=call):
@@ -70,7 +72,8 @@ if VERBOSE:
 class Juju(object):
     """A wrapper around a juju binary."""
 
-    def __init__(self, binary_path=None, model=None, cfgdir=None, sudo=None):
+    def __init__(self, binary_path=None, model=None, cfgdir=None, sudo=None,
+                 juju_ssh=True):
         if binary_path is None:
             binary_path = JUJU
         if model is DEFAULT_MODEL:
@@ -80,6 +83,7 @@ class Juju(object):
         self.model = model
         self.cfgdir = cfgdir
         self.sudo = sudo
+        self.juju_ssh = juju_ssh
 
         if binary_path == JUJU1:
             self.envvar = "JUJU_HOME"
@@ -89,6 +93,13 @@ class Juju(object):
         self.env = None
         if cfgdir is not None:
             self.env = dict(os.environ, **{self.envvar: cfgdir})
+            self.ssh_key = os.path.join(cfgdir, "ssh", "juju_id_rsa")
+        else:
+            # XXX This default config directory will only work on JUJU2
+            default_cfgdir = os.path.join(
+                os.path.expanduser("~"), ".local", "share", "juju")
+            cfgdir = os.environ.get(self.envvar, default_cfgdir)
+            self.ssh_key = os.path.join(cfgdir, "ssh", "juju_id_rsa")
 
     def __repr__(self):
         args = ", ".join("{}={!r}".format(name, getattr(self, name))
@@ -139,19 +150,35 @@ class Juju(object):
         args = self.set_model_config_args(key, value)
         return self._format(args)
 
+    def _direct_ssh_args(self, ssh_cmd):
+        """Return argument list for ssh commands using juju's private key."""
+        # Don't use juju ssh commands per lp:1473069
+        return [
+            "/usr/bin/{}".format(ssh_cmd), "-o", "StrictHostKeyChecking=no",
+            "-i", self.ssh_key]
+
     def ssh_args(self, unit, cmd):
         """Return the subprocess.* args for an SSH command."""
-        return self._resolve("ssh", unit, cmd)
+        if self.juju_ssh:
+            return self._resolve("ssh", unit.name, cmd)
+        direct_ssh_args = self._direct_ssh_args("ssh")
+        return direct_ssh_args + ["ubuntu@{}".format(unit.ip), cmd]
 
     def pull_args(self, unit, source, target="."):
         """Return the subprocess.* args for an SCP command."""
-        source = "{}:{}".format(unit, source)
-        return self._resolve("scp", source, target)
+        if self.juju_ssh:
+            source = "{}:{}".format(unit.name, source)
+            return self._resolve("scp", source, target)
+        source = "ubuntu@{}:{}".format(unit.ip, source)
+        return self._direct_ssh_args("scp") + [source, target]
 
     def push_args(self, unit, source, target):
         """Return the subprocess.* args for an SCP command."""
-        target = "{}:{}".format(unit, target)
-        return self._resolve("scp", source, target)
+        if self.juju_ssh:
+            target = "{}:{}".format(unit.name, target)
+            return self._resolve("scp", source, target)
+        target = "ubuntu@{}:{}".format(unit.ip, target)
+        return self._direct_ssh_args("scp") + [source, target]
 
     def format(self, cmd, *subargs):
         """Return the formatted command.
@@ -210,11 +237,20 @@ def juju_status(juju):
     return yaml.load(output)
 
 
-def get_units(juju, status=None):
-    """Return a list with all units."""
+def get_bootstrap_ip(juju, status=None):
     if status is None:
         status = juju_status(juju)
-    units = []
+    if "machines" not in status:
+        sys.exit("ERROR, no machines found. Make sure the right juju "
+                 "environment is set.")
+    return status["machines"]["0"]["dns-name"]
+
+
+def get_units(juju, status=None):
+    """Return a list of JujuUnits."""
+    if status is None:
+        status = juju_status(juju)
+    juju_units = []
     if "services" in status:
         applications = status["services"]
     else:
@@ -224,36 +260,36 @@ def get_units(juju, status=None):
         if "subordinate-to" in applications[application].keys():
             continue
         if "units" in applications[application]:
-            units.extend(applications[application]["units"].keys())
-    if len(units) == 0:
+            for name, unit in applications[application]["units"].items():
+                juju_units.append(JujuUnit(name, unit["public-address"]))
+    if len(juju_units) == 0:
         sys.exit("ERROR, no units found. Make sure the right juju environment"
                  "is set.")
-    return units
-
+    return juju_units
 
 def _create_ps_output_file(juju, unit):
     """List running processes and redirect them to a file."""
-    log.info("Collecting ps output on unit {}".format(unit))
+    log.info("Collecting ps output on unit {}".format(unit.name))
     ps_cmd = "ps fauxww | sudo tee /var/log/ps-fauxww.txt"
     args = juju.ssh_args(unit, ps_cmd)
     try:
         check_output(args, stderr=STDOUT, env=juju.env)
     except CalledProcessError as e:
         log.warning(
-            "Failed to collect running processes on unit {}".format(unit))
+            "Failed to collect running processes on unit {}".format(unit.name))
         log.warning(e.output)
         log.warning(e.returncode)
 
 
 def _create_log_tarball(juju, unit):
-    log.info("Creating tarball on unit {}".format(unit))
+    log.info("Creating tarball on unit {}".format(unit.name))
     exclude = " ".join(["--exclude=%s" % x for x in EXCLUDED])
     logs = "$(sudo sh -c \"ls -1d %s 2>/dev/null\")" % " ".join(LOGS)
     # --ignore-failed-read avoids failure for unreadable files (not for files
     # being written)
     tar_cmd = "sudo tar --ignore-failed-read"
-    logsuffix = unit.replace("/", "-")
-    if unit == "0":
+    logsuffix = unit.name.replace("/", "-")
+    if unit.name == "0":
         logsuffix = "bootstrap"
     cmd = "{} {} -cf /tmp/logs_{}.tar {}".format(
         tar_cmd, exclude, logsuffix, logs)
@@ -275,7 +311,7 @@ def _create_log_tarball(juju, unit):
                     "tar returned 1, proceeding anyway: {}".format(e.output))
                 break
             log.warning(
-                "Failed to archive log files on unit {}".format(unit))
+                "Failed to archive log files on unit {}".format(unit.name))
             log.warning(e.output)
             log.warning(e.returncode)
             if i < 4:
@@ -296,15 +332,15 @@ def _create_log_tarball(juju, unit):
         check_output(args, stderr=STDOUT, env=juju.env)
     except CalledProcessError as e:
         log.warning(
-            "Failed to create remote log tarball on unit {}".format(unit))
+            "Failed to create remote log tarball on unit {}".format(unit.name))
         log.warning(e.output)
         log.warning(e.returncode)
 
 
 def download_log_from_unit(juju, unit):
-    log.info("Downloading tarball from unit %s" % unit)
-    unit_filename = unit.replace("/", "-")
-    if unit == "0":
+    log.info("Downloading tarball from unit %s" % unit.name)
+    unit_filename = unit.name.replace("/", "-")
+    if unit.name == "0":
         unit_filename = "bootstrap"
     remote_filename = "logs_%s.tar.gz" % unit_filename
     try:
@@ -315,7 +351,7 @@ def download_log_from_unit(juju, unit):
         call(args)
         os.unlink(remote_filename)
     except:
-        log.warning("error collecting logs from %s, skipping" % unit)
+        log.warning("error collecting logs from %s, skipping" % unit.name)
     finally:
         if os.path.exists(remote_filename):
             os.unlink(remote_filename)
@@ -331,13 +367,13 @@ def collect_logs(juju):
     """
     units = get_units(juju)
     # include bootstrap
-    units.append("0")
+    units.append(JujuUnit("0", get_bootstrap_ip(juju)))
 
     log.info("Collecting running processes for all units including bootstrap")
     map(partial(_create_ps_output_file, juju), units)
 
     log.info("Creating remote tarball in parallel for units %s" % (
-        ",".join(units)))
+        ",".join([u.name for u in units])))
     map(partial(_create_log_tarball, juju), units)
     log.info("Downloading logs from units")
 
@@ -352,8 +388,9 @@ def _mp_map(func, args):
 def get_landscape_unit(units):
     """Return the landscape unit among the units list."""
     units = [
-        unit for unit in units if unit.startswith("landscape-server/") or
-        unit.startswith("landscape/")]
+        unit for unit in units
+        if unit.name.startswith("landscape-server/") or
+        unit.name.startswith("landscape/")]
     if len(units) == 0:
         return None
     else:
@@ -540,12 +577,13 @@ def bundle_logs(tmpdir, tarfile, extrafiles=[]):
     call(args)
 
 
-def get_juju(binary_path, model=DEFAULT_MODEL, cfgdir=None, inner=False):
+def get_juju(binary_path, model=DEFAULT_MODEL, cfgdir=None, inner=False,
+             juju_ssh=True):
     """Return a Juju for the provided info."""
     if model is DEFAULT_MODEL and inner and binary_path != JUJU1:
         # We assume that this is a Landscape-bootstrapped controller.
         model = "controller"
-    return Juju(binary_path, model=model, cfgdir=cfgdir)
+    return Juju(binary_path, model=model, cfgdir=cfgdir, juju_ssh=juju_ssh)
 
 
 def get_option_parser():
@@ -603,7 +641,8 @@ if __name__ == "__main__":
     parser = get_option_parser()
     args = parser.parse_args(sys.argv[1:])
     tarfile = os.path.abspath(args.tarfile)
-    juju = get_juju(args.juju, args.model, args.cfgdir, args.inner)
+    juju = get_juju(
+        args.juju, args.model, args.cfgdir, args.inner, juju_ssh=False)
     if args.inner:
         log.info("# start inner ##############################")
     try:
