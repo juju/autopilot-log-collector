@@ -1,0 +1,3 @@
+install: pip install --user fixtures mock pyyaml
+script:
+  - make ci-test
