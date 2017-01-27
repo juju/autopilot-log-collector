@@ -55,6 +55,11 @@ VERBOSE = False
 
 JujuUnit = namedtuple("JujuUnit", ["name", "ip"])
 
+# This contant is a marker to indicate that public-address wasn't found for a
+# JujuUnit. In these cases, 'juju ssh <unit_name>' will be used instead of
+# 'ssh ubuntu@<unit_ip>'
+NO_PUBLIC_ADDRESS = "No public-address found"
+
 if VERBOSE:
     def call(args, env=None, _call=call):
         print("  running {!r}".format(" ".join(args)))
@@ -159,14 +164,14 @@ class Juju(object):
 
     def ssh_args(self, unit, cmd):
         """Return the subprocess.* args for an SSH command."""
-        if self.juju_ssh:
+        if self.juju_ssh or unit.ip == NO_PUBLIC_ADDRESS:
             return self._resolve("ssh", unit.name, cmd)
         direct_ssh_args = self._direct_ssh_args("ssh")
         return direct_ssh_args + ["ubuntu@{}".format(unit.ip), cmd]
 
     def pull_args(self, unit, source, target="."):
         """Return the subprocess.* args for an SCP command."""
-        if self.juju_ssh:
+        if self.juju_ssh or unit.ip == NO_PUBLIC_ADDRESS:
             source = "{}:{}".format(unit.name, source)
             return self._resolve("scp", source, target)
         source = "ubuntu@{}:{}".format(unit.ip, source)
@@ -174,7 +179,7 @@ class Juju(object):
 
     def push_args(self, unit, source, target):
         """Return the subprocess.* args for an SCP command."""
-        if self.juju_ssh:
+        if self.juju_ssh or unit.ip == NO_PUBLIC_ADDRESS:
             target = "{}:{}".format(unit.name, target)
             return self._resolve("scp", source, target)
         target = "ubuntu@{}:{}".format(unit.ip, target)
@@ -261,7 +266,13 @@ def get_units(juju, status=None):
             continue
         if "units" in applications[application]:
             for name, unit in applications[application]["units"].items():
-                juju_units.append(JujuUnit(name, unit["public-address"]))
+                if not unit.get("public-address"):
+                    log.warning( 
+                        "Couldn't obtain public-address for unit {}".format(
+                            name))
+                    juju_units.append(JujuUnit(name, NO_PUBLIC_ADDRESS))
+                else:
+                    juju_units.append(JujuUnit(name, unit["public-address"]))
     if len(juju_units) == 0:
         sys.exit("ERROR, no units found. Make sure the right juju environment"
                  "is set.")
