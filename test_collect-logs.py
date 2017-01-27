@@ -396,9 +396,93 @@ class MainTestCase(_BaseTestCase):
         self.assertFalse(os.path.exists(self.tempdir))
 
 
+class CreateOutputFilesTestCase(_BaseTestCase):
+
+    MOCKED = ("call", "check_output", "get_units", "get_hosts", "mkdtemp")
+
+    def setUp(self):
+        super(CreateOutputFilesTestCase, self).setUp()
+        self.hosts = [
+            script.JujuHost("0", "1.2.3.8"),
+        ]
+        script.get_hosts.return_value = self.hosts[:]
+        self.tmpdir = tempfile.mkdtemp()
+        script.mkdtemp.return_value = self.tmpdir
+
+    def tearDown(self):
+        if os.path.exists(self.tmpdir):
+            # self.tmpdir is returned by the mocked tempfile.mkdtemp()
+            # Normally, this won't exist as collect-logs should remove it.
+            shutil.rmtree(self.tmpdir)
+        super(CreateOutputFilesTestCase, self).tearDown()
+
+    def test_get_ps_mem_with_git_clone(self):
+        """
+        Clone the ps_mem repo when there is no local copy.
+        """
+        ps_mem_file = os.path.join(self.tmpdir, "ps_mem.py")
+        repo_path = os.path.join(self.tmpdir, "ps_mem")
+        script._get_ps_mem(ps_mem_file, script.PS_MEM_REPO, repo_path)
+        expected = [
+            mock.call(["git", "clone", script.PS_MEM_REPO, repo_path],
+            stderr=subprocess.STDOUT),
+        ]
+        self.assertEqual(expected, script.check_output.call_args_list)
+
+    def test_get_ps_mem_local(self):
+        """
+        Don't clone the ps_mem repo when there is a local copy.
+        """
+        ps_mem_file = os.path.join(self.tmpdir, "ps_mem.py")
+        with open(ps_mem_file, 'w') as outfile:
+            outfile.write("# This is a fake ps_mem.py")
+        repo_path = os.path.join(self.tmpdir, "ps_mem")
+        result = script._get_ps_mem(ps_mem_file, script.PS_MEM_REPO, repo_path)
+        self.assertEqual(ps_mem_file, result)
+        script.check_output.assert_not_called()
+
+    def test_upload_ps_mem(self):
+        """
+        Verify that the repo is cloned and file uploaded.
+        """
+        script.upload_ps_mem(self.juju, self.hosts[0])
+        repo_path = os.path.join(self.tmpdir, "ps_mem")
+        expected = [
+            mock.call(["git", "clone", script.PS_MEM_REPO, repo_path],
+            stderr=subprocess.STDOUT),
+        ]
+        self.assertEqual(expected, script.check_output.call_args_list)
+        source = os.path.join(repo_path, "ps_mem.py")
+        target = "{}:/tmp/ps_mem.py".format(self.hosts[0].name)
+        expected = [
+            mock.call(["juju", "scp", source, target],
+                      env=None),
+        ]
+        self.assertEqual(expected, script.call.call_args_list)
+
+    def test_create_ps_mem_output_file(self):
+        """
+        Verify expected commands when creating the ps_mem output.
+        """
+        script._create_ps_mem_output_file(self.juju, self.hosts[0])
+        repo_path = os.path.join(self.tmpdir, "ps_mem")
+        expected = [
+            mock.call([
+                "juju", "ssh", "0",
+                "if ! python -V; then sudo apt-get install -y python; fi"],
+            env=None, stderr=subprocess.STDOUT),
+            mock.call([
+                "juju", "ssh", "0",
+                "sudo /tmp/ps_mem.py -S | sudo tee /var/log/ps_mem.txt"],
+            env=None, stderr=subprocess.STDOUT),
+        ]
+        self.assertEqual(expected, script.check_output.call_args_list)
+
+
 class CollectLogsTestCase(_BaseTestCase):
 
-    MOCKED = ("get_units", "get_bootstrap_ip", "check_output", "call")
+    MOCKED = ("get_units", "get_bootstrap_ip", "check_output", "call",
+              "get_hosts", "upload_ps_mem", "_create_ps_mem_output_file")
 
     def setUp(self):
         super(CollectLogsTestCase, self).setUp()
@@ -411,6 +495,10 @@ class CollectLogsTestCase(_BaseTestCase):
             ]
         script.get_units.return_value = self.units[:]
         script.get_bootstrap_ip.return_value = self.units[0].ip
+        self.hosts = [
+            script.JujuHost("0", "1.2.3.8"),
+        ]
+        script.get_hosts.return_value = self.hosts[:]
 
         self.mp_map_orig = script._mp_map
         script._mp_map = lambda f, a: map(f, a)
@@ -487,6 +575,10 @@ class CollectLogsTestCase(_BaseTestCase):
                                       ))
         self.assertEqual(script.check_output.call_count, len(expected))
         script.check_output.assert_has_calls(expected, any_order=True)
+        # for _create_ps_mem_output_file
+        script._create_ps_mem_output_file.assert_has_calls([
+            mock.call(self.juju, self.hosts[0]),
+        ])
         # for download_log_from_unit()
         expected = []
         for unit in units:
@@ -565,6 +657,10 @@ class CollectLogsTestCase(_BaseTestCase):
                  ))
         self.assertEqual(script.check_output.call_count, len(expected))
         script.check_output.assert_has_calls(expected, any_order=True)
+        # for _create_ps_mem_output_file
+        script._create_ps_mem_output_file.assert_has_calls([
+            mock.call(self.juju, self.hosts[0]),
+        ])
         # for download_log_from_unit()
         expected = []
         for unit in units:
@@ -593,6 +689,19 @@ class CollectLogsTestCase(_BaseTestCase):
 
         script.get_units.assert_called_once_with(self.juju)
         script.check_output.assert_not_called()
+        script.call.assert_not_called()
+
+    def test_get_hosts_failure(self):
+        """
+        collect_logs() does not handle errors from get_hosts().
+        """
+        script.get_hosts.side_effect = FakeError()
+
+        with self.assertRaises(FakeError):
+            script.collect_logs(self.juju)
+
+        script.get_hosts.assert_called_once_with(self.juju)
+        self.assertEqual(script.check_output.call_count, 5)
         script.call.assert_not_called()
 
     def test_check_output_failure(self):
@@ -646,7 +755,8 @@ class CollectLogsTestCase(_BaseTestCase):
 
 class CollectInnerLogsTestCase(_BaseTestCase):
 
-    MOCKED = ("get_units", "check_output", "call", "check_call")
+    MOCKED = ("get_units", "check_output", "call", "check_call",
+              "upload_ps_mem")
 
     def setUp(self):
         super(CollectInnerLogsTestCase, self).setUp()

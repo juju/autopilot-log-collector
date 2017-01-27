@@ -42,6 +42,9 @@ LOGS = [
 EXCLUDED = ["/var/lib/landscape/client/package/hash-id",
             "/var/lib/juju/containers/juju-*-lxc-template"]
 LANDSCAPE_JUJU_HOME = "/var/lib/landscape/juju-homes"
+# ps_mem is used for memory footprint collection
+# The original repo is https://github.com/pixelb/ps_mem
+PS_MEM_REPO = "https://github.com/fginther/ps_mem.git"
 
 JUJU1 = "juju"
 # XXX This is going to break once juju-2.1 happens.
@@ -53,6 +56,7 @@ DEFAULT_MODEL = object()
 
 VERBOSE = False
 
+JujuHost = namedtuple("JujuHost", ["name", "ip"])
 JujuUnit = namedtuple("JujuUnit", ["name", "ip"])
 
 # This contant is a marker to indicate that public-address wasn't found for a
@@ -278,18 +282,108 @@ def get_units(juju, status=None):
                  "is set.")
     return juju_units
 
-def _create_ps_output_file(juju, unit):
-    """List running processes and redirect them to a file."""
-    log.info("Collecting ps output on unit {}".format(unit.name))
-    ps_cmd = "ps fauxww | sudo tee /var/log/ps-fauxww.txt"
-    args = juju.ssh_args(unit, ps_cmd)
+
+def get_hosts(juju, status=None):
+    """Return a list of machine hosts (not lxds)."""
+    if status is None:
+        status = juju_status(juju)
+    if "machines" not in status:
+        sys.exit("ERROR, no machines found. Make sure the right juju "
+                 "environment is set.")
+    juju_hosts = []
+    for name, machine in status["machines"].items():
+        juju_hosts.append(JujuHost(name, machine["dns-name"]))
+    return juju_hosts
+
+
+def _get_ps_mem(ps_mem, repo, repo_path):
+    if os.path.isfile(ps_mem):
+        # ps_mem already exists here via the push from the outer environment
+        log.info("Using uploaded {}".format(ps_mem))
+        return ps_mem
+
+    message = "Cloning ps_mem git repo {}".format(repo)
+    log.info(message)
+    try:
+        cmd = ["git", "clone", repo, repo_path]
+        check_output(cmd, stderr=STDOUT)
+    except CalledProcessError as e:
+        log.warning("Failed: " + message)
+        log.warning(e.output)
+        log.warning(e.returncode)
+        raise
+    return os.path.join(repo_path, "ps_mem.py")
+
+
+def upload_ps_mem(juju, unit):
+    """
+    Clone the ps_mem repository and upload ps_mem.py to the given unit.
+    """
+    ps_mem_tmpdir = mkdtemp()
+    ps_mem = "/tmp/ps_mem.py"
+    try:
+        # Fetch the ps_mem utility from the github repo
+        # or the host unit if this is running on the inner model
+        ps_mem_source = _get_ps_mem(
+            ps_mem, PS_MEM_REPO, os.path.join(ps_mem_tmpdir, "ps_mem"))
+
+        # Upload ps_mem to the unit
+        args = juju.push_args(unit, ps_mem_source, ps_mem)
+        call(args, env=juju.env)
+    except CalledProcessError:
+        # Error messages are provided by _get_ps_mem_repo()
+        # Treat these exceptions as non-fatal and continue collecting logs
+        pass
+
+    finally:
+        shutil.rmtree(ps_mem_tmpdir)
+
+
+def _run_cmd(juju, unit, cmd, description):
+    """Helper method for running a command on a juju unit or host."""
+    log.info(description)
+    args = juju.ssh_args(unit, cmd)
     try:
         check_output(args, stderr=STDOUT, env=juju.env)
     except CalledProcessError as e:
-        log.warning(
-            "Failed to collect running processes on unit {}".format(unit.name))
+        log.warning("Failed: " + description)
         log.warning(e.output)
         log.warning(e.returncode)
+        raise
+
+
+def _create_ps_output_file(juju, unit):
+    """List running processes and redirect them to a file."""
+    message = "Collecting ps output on unit {}".format(unit.name)
+    ps_cmd = "ps fauxww | sudo tee /var/log/ps-fauxww.txt"
+    try:
+        _run_cmd(juju, unit, ps_cmd, message)
+    except CalledProcessError:
+        # Error messages are provided by _run_cmd()
+        pass
+
+
+def _create_ps_mem_output_file(juju, unit):
+    """
+    Gather the aggregate memory footprint of each process using ps_mem.
+    """
+    # The ps_mem utility is already present thanks to upload_ps_mem()
+    ps_mem = "/tmp/ps_mem.py"
+    try:
+        # ps_mem requries python 2, make sure it is installed
+        message = "Installing python for ps_mem on unit {}".format(unit.name)
+        apt_cmd = "if ! python -V; then sudo apt-get install -y python; fi"
+        _run_cmd(juju, unit, apt_cmd, message)
+
+        # Run ps_mem.py with -S to collect memory and swap footprint
+        ps_mem_cmd = "sudo {} -S | sudo tee /var/log/ps_mem.txt".format(ps_mem)
+        message = "Collecting {} output on unit {}".format(
+            ps_mem, unit.name)
+        _run_cmd(juju, unit, ps_mem_cmd, message)
+    except CalledProcessError:
+        # Error messages are provided by _run_cmd()
+        # Treat these exceptions as non-fatal and continue collecting logs
+        pass
 
 
 def _create_log_tarball(juju, unit):
@@ -377,11 +471,16 @@ def collect_logs(juju):
     and expanded, and the tarball is then deleted.
     """
     units = get_units(juju)
-    # include bootstrap
+    # include bootstrap as one of the units
     units.append(JujuUnit("0", get_bootstrap_ip(juju)))
 
     log.info("Collecting running processes for all units including bootstrap")
     map(partial(_create_ps_output_file, juju), units)
+
+    log.info("Collecting ps_mem output for all hosts including bootstrap")
+    hosts = get_hosts(juju)
+    map(partial(upload_ps_mem, juju), hosts)
+    map(partial(_create_ps_mem_output_file, juju), hosts)
 
     log.info("Creating remote tarball in parallel for units %s" % (
         ",".join([u.name for u in units])))
@@ -526,6 +625,8 @@ def collect_inner_logs(juju, inner_model=DEFAULT_MODEL):
     inner_filename = os.path.join("/tmp", filename)
     args = juju.ssh_args(landscape_unit, "sudo rm -rf " + inner_filename)
     call(args, env=juju.env)
+    # Upload ps_mem.py to allow uploading to each host in the inner model
+    upload_ps_mem(juju, landscape_unit)
 
     # Collect the logs for the inner model.
     cmd = format_collect_logs(inner_juju, collect_logs, inner_filename)
