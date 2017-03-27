@@ -23,6 +23,8 @@ LOGS = [
     "/var/log",
     "/etc/hosts",
     "/etc/network",
+    # for any core files
+    "/var/crash",
     # for the landscape client
     "/var/lib/landscape/client",
     # for the landscape server charm
